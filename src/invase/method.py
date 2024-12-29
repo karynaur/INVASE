@@ -2,7 +2,7 @@
 import copy
 import itertools
 from abc import ABCMeta, abstractmethod
-from typing import Any, Generator, List, Optional, Union
+from typing import Any, Generator, List, Literal, Optional, Union
 
 # third party
 import matplotlib.pyplot as plt
@@ -16,6 +16,7 @@ from pydantic import validate_arguments
 from sklearn.model_selection import KFold, train_test_split
 from sklearn.utils import resample
 from torch import nn
+from tqdm import tqdm
 
 # adjutorium absolute
 import invase.logger as log
@@ -184,7 +185,7 @@ class invaseBase(metaclass=ABCMeta):
         train_indices = np.arange(n)
 
         # Train critic NN
-        for epoch in range(self.epochs):
+        for epoch in tqdm(range(self.epochs)):
             np.random.shuffle(train_indices)
             train_loss = []
             for b in range(n_batches):
@@ -248,7 +249,9 @@ class invaseClassifier(invaseBase):
         batch_size: int = 300,
         learning_rate: float = 1e-3,
         penalty_l2: float = 1e-3,
+        method: Literal['normal', 'optimized'] = 'normal',
     ) -> None:
+        self.method = method
         X = np.asarray(X)
         self.latent_dim2 = critic_latent_dim  # Dimension of critic network
 
@@ -325,9 +328,20 @@ class invaseClassifier(invaseBase):
     @validate_arguments(config=dict(arbitrary_types_allowed=True))
     def _importance_init(self, x: torch.Tensor) -> torch.Tensor:
         return torch.zeros(x.shape).to(DEVICE)
-
+    
     @validate_arguments(config=dict(arbitrary_types_allowed=True))
     def _importance_test(
+        self, estimator: Any, x: torch.Tensor, y: torch.Tensor
+    ) -> torch.Tensor:
+        if self.method == 'normal':
+            return self._importance_test_normal(estimator, x, y)
+        elif self.method == 'optimized':
+            return self._importance_test_optimized(estimator, x, y)
+        else:
+            raise RuntimeError(f"Invalid method {self.method}")
+
+    @validate_arguments(config=dict(arbitrary_types_allowed=True))
+    def _importance_test_normal(
         self, estimator: Any, x: torch.Tensor, y: torch.Tensor
     ) -> torch.Tensor:
         importance = self._importance_init(x)
@@ -368,6 +382,58 @@ class invaseClassifier(invaseBase):
 
         importance -= importance.min(-1, keepdim=True)[0]
         importance /= importance.max(-1, keepdim=True)[0] + EPS
+
+        return importance.float()
+    
+    @validate_arguments(config=dict(arbitrary_types_allowed=True))
+    def _importance_test_optimized(
+        self, estimator: Any, x: torch.Tensor, y: torch.Tensor
+    ) -> torch.Tensor:
+        importance = self._importance_init(x)
+        n_features = x.shape[-1]
+        
+        # 1. Batch processing for baseline importance
+        all_masks = torch.stack(list(bitmask_intervals(n_features, n_features - 1, n_features)))
+        batch_size = 64
+                
+        for i in range(0, len(all_masks), batch_size):
+            batch_masks = all_masks[i:i + batch_size]
+            batch_masks = batch_masks.unsqueeze(0).repeat(x.shape[0], 1, 1).to(DEVICE)
+            
+            flat_x = x.unsqueeze(1).repeat(1, batch_masks.shape[1], 1)
+            masked_batch = self.masking([flat_x.reshape(-1, n_features), 
+                                    batch_masks.reshape(-1, n_features)])
+            
+            # Handle different y tensor shapes
+            if len(y.shape) == 1:
+                y = y.unsqueeze(-1)
+            y_repeated = y.unsqueeze(1).expand(-1, batch_masks.shape[1], -1)
+            y_flat = y_repeated.reshape(-1, y.shape[-1])
+            
+            baseline_losses = self._baseline_metric(estimator, masked_batch, y_flat)
+            baseline_losses = baseline_losses.reshape(x.shape[0], -1)
+            
+            importance = torch.max(importance, 
+                                ((1 - batch_masks) * baseline_losses.unsqueeze(-1)).max(dim=1)[0])
+
+        # 2. Feature interactions with limited depth
+        max_interactions = min(3, n_features - 1)
+        samples_per_level = 10
+        
+        for interaction_level in range(2, max_interactions + 1):
+            for _ in range(samples_per_level):
+                mask = torch.zeros((x.shape[0], n_features)).to(DEVICE)
+                selected_features = torch.randperm(n_features)[:interaction_level]
+                mask[:, selected_features] = 1
+                
+                masked_batch = self.masking([x, mask])
+                baseline_loss = self._baseline_metric(estimator, masked_batch, y)
+                
+                importance += 0.001 * ((1 - mask).T * baseline_loss).T
+
+        # 3. Normalize
+        importance = (importance - importance.min(-1, keepdim=True)[0]) / \
+                    (importance.max(-1, keepdim=True)[0] - importance.min(-1, keepdim=True)[0] + EPS)
 
         return importance.float()
 
@@ -531,6 +597,7 @@ class invaseCV:
         n_epoch_print: int = 50,
         n_folds: int = 5,
         seed: int = 42,
+        method: Literal['normal', 'optimized'] = 'normal',
     ) -> None:
         self.fold_models = []
 
@@ -545,6 +612,8 @@ class invaseCV:
                     n_epoch_inner=n_epoch_inner,
                     patience=patience,
                     min_epochs=min_epochs,
+                    n_epoch_print=n_epoch_print,
+                    method=method,
                 )
             )
 
@@ -589,6 +658,7 @@ class INVASE:
         samples: int = 2000,
         prefit: bool = False,
         random_state: int = 0,
+        method: Literal['normal', 'optimized'] = 'normal',
     ) -> None:
         enable_reproducible_results(random_state)
         if task_type not in [
@@ -618,7 +688,7 @@ class INVASE:
                 model.fit(X, y)
             if n_folds == 1:
                 self.explainer = invaseClassifier(
-                    model, X, n_epoch=n_epoch, n_epoch_inner=n_epoch_inner
+                    model, X, n_epoch=n_epoch, n_epoch_inner=n_epoch_inner, method=method,
                 )
             else:
                 self.explainer = invaseCV(
@@ -627,6 +697,7 @@ class INVASE:
                     n_epoch=n_epoch,
                     n_folds=n_folds,
                     n_epoch_inner=n_epoch_inner,
+                    method=method,
                 )
         elif task_type in ["risk_estimation"]:
             if eval_times is None:
